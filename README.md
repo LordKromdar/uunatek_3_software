@@ -32,11 +32,11 @@ one program can hold the serial port.
 2. **Check pen Z direction**: with a pen fitted, click `Pen down` then
    `Pen up`. Defaults: **Z0 = pen raised, Z10 = pen on paper**. If
    your machine moves the opposite way, swap the two Z values.
-3. **Check orientation**: plot a small asymmetric test. If it comes
-   out mirrored or rotated, toggle the `Mirror machine X/Y` boxes in
-   the size panel until the plot matches the preview. The preview
-   always shows the true on-paper appearance; mirroring is applied
-   only to the generated G-code.
+3. **Check orientation**: the preview shows the paper as the plotter
+   sees it: the red cross (top-left) is machine X0 Y0, X grows right,
+   Y grows down. Plot a small asymmetric test; it should match the
+   preview. If it comes out mirrored, tick `Mirror X` / `Mirror Y`:
+   they flip the artwork in place, in the preview and in the G-code.
 4. Do a dry run with no pen (or pen high) on a small test SVG before
    committing to a 3-hour plot.
 

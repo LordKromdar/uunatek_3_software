@@ -11,9 +11,10 @@ swap pens, and can also export the G-code to a file.
 from __future__ import annotations
 
 import sys
+import os
 import threading
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtGui import (QColor, QPainter, QPen, QBrush, QIcon, QPixmap,
                            QPainterPath)
 from PySide6.QtWidgets import (
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QPushButton, QDoubleSpinBox, QCheckBox, QComboBox, QLabel,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene, QFileDialog,
     QPlainTextEdit, QProgressBar, QMessageBox, QAbstractItemView, QGridLayout,
-    QLineEdit,
+    QLineEdit, QScrollArea, QFrame,
 )
 
 from svg_loader import load_svg, Artwork
@@ -198,11 +199,20 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         layout = QHBoxLayout(root)
-        layout.addWidget(self._build_side_panel(), 0)
+        # Side panel lives in a scroll area so it works on short screens.
+        scroll = QScrollArea()
+        scroll.setWidget(self._build_side_panel())
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(400 + scroll.verticalScrollBar().sizeHint().width()
+                             + 4)
+        layout.addWidget(scroll, 0)
         layout.addWidget(self.view, 1)
         self.setCentralWidget(root)
         self._refresh_ports()
         self.unit_combo.setCurrentIndex(1)   # default to inches
+        self._load_prefs()
         self._update_preview()
 
     # ------------------------------------------------------------ UI build
@@ -262,6 +272,18 @@ class MainWindow(QMainWindow):
         form.addRow("Artwork W x H", aw)
         form.addRow("", self.lock_aspect)
 
+        # Scale relative to the SVG's own size (100 % = as drawn in the
+        # file). Changing it resizes the artwork; press Center afterwards.
+        self.scale_pct = QDoubleSpinBox()
+        self.scale_pct.setRange(1, 1000)
+        self.scale_pct.setDecimals(1)
+        self.scale_pct.setSingleStep(5)
+        self.scale_pct.setValue(100)
+        self.scale_pct.setSuffix(" %")
+        self.scale_pct.setKeyboardTracking(False)
+        self.scale_pct.valueChanged.connect(self._scale_edited)
+        form.addRow("Scale", self.scale_pct)
+
         self.off_x = self._spin(0, -500, 2000)
         self.off_y = self._spin(0, -500, 2000)
         self.off_x.valueChanged.connect(self._update_preview)
@@ -272,8 +294,13 @@ class MainWindow(QMainWindow):
         ow.addWidget(self.off_y)
         form.addRow("Offset X, Y", ow)
 
+        self.margin = self._spin(10, 0, 500)
+        self.margin.setToolTip("Blank border kept free on all four sides "
+                               "by 'Fit to margins'.")
+        form.addRow("Margin", self.margin)
+
         fit_row = QHBoxLayout()
-        fit_btn = QPushButton("Fit to paper")
+        fit_btn = QPushButton("Fit to margins")
         fit_btn.clicked.connect(lambda: self.fit_to_paper())
         center_btn = QPushButton("Center")
         center_btn.clicked.connect(lambda: self.center_on_paper())
@@ -283,14 +310,16 @@ class MainWindow(QMainWindow):
 
         # Machine-side orientation. These mirror the generated G-code so
         # the plot matches the preview; the preview itself never mirrors.
-        self.mirror_x = QCheckBox("Mirror machine X")
+        self.mirror_x = QCheckBox("Mirror X")
         self.mirror_x.setChecked(False)
-        self.mirror_y = QCheckBox("Mirror machine Y")
+        self.mirror_y = QCheckBox("Mirror Y")
         self.mirror_y.setChecked(False)
         mrow = QHBoxLayout()
+        self.mirror_x.toggled.connect(lambda _c: self._update_preview())
+        self.mirror_y.toggled.connect(lambda _c: self._update_preview())
         mrow.addWidget(self.mirror_x)
         mrow.addWidget(self.mirror_y)
-        form.addRow("Orientation", mrow)
+        form.addRow("Mirror artwork", mrow)
         v.addWidget(size_box)
 
         # --- pen & speed ---
@@ -299,13 +328,22 @@ class MainWindow(QMainWindow):
         # On the iDraw/DrawCore Z axis, Z0 is the pen RAISED and larger
         # Z values lower the pen toward the paper.
         self.pen_up = self._spin(0, 0, 10, step=0.5)
+        self.pen_touch = self._spin(5, 0, 10, step=0.5)
         self.pen_down = self._spin(10, 0, 10, step=0.5)
         self.draw_feed = self._spin(10000, 100, 12000, step=100)
         self.z_feed = self._spin(2500, 100, 5000, step=100)
         pform.addRow("Pen-up Z (mm)", self.pen_up)
+        pform.addRow("Pen-touch Z (mm)", self.pen_touch)
         pform.addRow("Pen-down Z (mm)", self.pen_down)
         pform.addRow("Draw feed (mm/min)", self.draw_feed)
         pform.addRow("Z feed (mm/min)", self.z_feed)
+        self.opacity_z = QCheckBox("Opacity controls Z (touch -> down)")
+        self.opacity_z.setChecked(True)
+        self.opacity_z.setToolTip(
+            "Opacity 0 lifts the pen, opacity 1 presses to Pen-down Z, "
+            "in between maps linearly from Pen-touch Z.")
+        self.opacity_z.toggled.connect(lambda _c: self._update_preview())
+        pform.addRow(self.opacity_z)
         v.addWidget(pen_box)
 
         # --- layers ---
@@ -410,10 +448,11 @@ class MainWindow(QMainWindow):
         step = 0.1 if index == 1 else 1.0
         self._syncing = True
         for spin in (self.paper_w, self.paper_h, self.art_w,
-                     self.art_h, self.off_x, self.off_y):
+                     self.art_h, self.off_x, self.off_y, self.margin):
             value = spin.value()          # read BEFORE decimals change
             spin.blockSignals(True)
-            spin.setDecimals(decimals)
+            spin.setDecimals(3 if (spin is self.margin and index == 1)
+                             else decimals)
             spin.setSingleStep(step)
             spin.setValue(value * ratio)
             spin.blockSignals(False)
@@ -422,6 +461,65 @@ class MainWindow(QMainWindow):
         unit = "inches" if index == 1 else "mm"
         self.size_box.setTitle(f"Paper && artwork size ({unit})")
         self._update_preview()
+
+    # ---------------------------------------------------------- preferences
+    # (label, widget attribute) pairs persisted between runs. Artwork size
+    # and offsets are deliberately not saved: they belong to each SVG.
+    _PREF_SPINS = ("pen_up", "pen_touch", "pen_down", "draw_feed", "z_feed")
+    _PREF_CHECKS = ("lock_aspect", "mirror_x", "mirror_y", "opacity_z")
+
+    def _load_prefs(self):
+        st = QSettings()
+        self._syncing = True
+        try:
+            # Units first: the paper fields are converted by this.
+            self.unit_combo.setCurrentIndex(
+                st.value("units", 1, type=int) % 2)
+            q = st.value("quality", "", type=str)
+            if q in QUALITY_LEVELS:
+                self.quality_combo.blockSignals(True)
+                self.quality_combo.setCurrentText(q)
+                self.quality_combo.blockSignals(False)
+            paper = st.value("paper", "", type=str)
+            if paper:
+                i = self.paper_combo.findText(paper)
+                if i >= 0:
+                    self.paper_combo.blockSignals(True)
+                    self.paper_combo.setCurrentIndex(i)
+                    self.paper_combo.blockSignals(False)
+            pw = st.value("paper_w_mm", 0.0, type=float)
+            ph = st.value("paper_h_mm", 0.0, type=float)
+            if pw > 0 and ph > 0:
+                self.paper_w.setValue(pw / self._unit_factor)
+                self.paper_h.setValue(ph / self._unit_factor)
+            m = st.value("margin_mm", -1.0, type=float)
+            if m >= 0:
+                self.margin.setValue(m / self._unit_factor)
+            for name in self._PREF_SPINS:
+                w = getattr(self, name)
+                w.setValue(st.value(name, w.value(), type=float))
+            for name in self._PREF_CHECKS:
+                w = getattr(self, name)
+                w.setChecked(st.value(name, w.isChecked(), type=bool))
+            geom = st.value("geometry")
+            if geom is not None:
+                self.restoreGeometry(geom)
+        finally:
+            self._syncing = False
+
+    def _save_prefs(self):
+        st = QSettings()
+        st.setValue("units", self.unit_combo.currentIndex())
+        st.setValue("quality", self.quality_combo.currentText())
+        st.setValue("paper", self.paper_combo.currentText())
+        st.setValue("paper_w_mm", self.paper_w.value() * self._unit_factor)
+        st.setValue("paper_h_mm", self.paper_h.value() * self._unit_factor)
+        st.setValue("margin_mm", self.margin.value() * self._unit_factor)
+        for name in self._PREF_SPINS:
+            st.setValue(name, getattr(self, name).value())
+        for name in self._PREF_CHECKS:
+            st.setValue(name, getattr(self, name).isChecked())
+        st.setValue("geometry", self.saveGeometry())
 
     def current_settings(self) -> PlotSettings:
         return PlotSettings(
@@ -432,6 +530,8 @@ class MainWindow(QMainWindow):
             flip_x=self.mirror_x.isChecked(),
             flip_y=self.mirror_y.isChecked(),
             pen_up_z=self.pen_up.value(),
+            pen_touch_z=self.pen_touch.value(),
+            pressure_from_opacity=self.opacity_z.isChecked(),
             pen_down_z=self.pen_down.value(),
             draw_feed=self.draw_feed.value(),
             z_feed=self.z_feed.value(),
@@ -449,10 +549,15 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ SVG / size
     def open_svg(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open SVG", "",
+        settings = QSettings()
+        start_dir = settings.value("last_svg_dir", "", type=str)
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = os.path.dirname(self.svg_path) if self.svg_path else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Open SVG", start_dir,
                                               "SVG files (*.svg)")
         if not path:
             return
+        settings.setValue("last_svg_dir", os.path.dirname(path))
         if self.loader and self.loader.isRunning():
             return
         self._start_load(path, keep_layout=False)
@@ -531,14 +636,42 @@ class MainWindow(QMainWindow):
             else:
                 self.art_w.setValue(self.art_h.value() * aspect)
             self._syncing = False
+        self._sync_scale()
         self._update_preview()
 
-    def fit_to_paper(self, margin_mm: float = 0.0):
+    def _natural_size_mm(self):
+        """Artwork size in mm as drawn in the SVG (SVG px = 1/96 in)."""
+        k = MM_PER_INCH / 96.0
+        return (max(self.artwork.width * k, 1e-9),
+                max(self.artwork.height * k, 1e-9))
+
+    def _sync_scale(self):
+        """Show the current artwork width as a % of its natural size."""
         if self.artwork is None:
             return
-        margin = margin_mm / self._unit_factor
-        avail_w = self.paper_w.value() - 2 * margin
-        avail_h = self.paper_h.value() - 2 * margin
+        nat_w, _ = self._natural_size_mm()
+        pct = self._mm(self.art_w.value()) / nat_w * 100.0
+        self.scale_pct.blockSignals(True)
+        self.scale_pct.setValue(min(max(pct, 1.0), 1000.0))
+        self.scale_pct.blockSignals(False)
+
+    def _scale_edited(self, pct: float):
+        if self.artwork is None:
+            return
+        nat_w, nat_h = self._natural_size_mm()
+        self._syncing = True
+        self.art_w.setValue(nat_w * pct / 100.0 / self._unit_factor)
+        self.art_h.setValue(nat_h * pct / 100.0 / self._unit_factor)
+        self._syncing = False
+        self._update_preview()
+
+    def fit_to_paper(self):
+        """Largest artwork that fits inside the paper minus the margins."""
+        if self.artwork is None:
+            return
+        margin = self.margin.value()
+        avail_w = max(self.paper_w.value() - 2 * margin, 0.1)
+        avail_h = max(self.paper_h.value() - 2 * margin, 0.1)
         aspect = self.artwork.width / max(self.artwork.height, 1e-9)
         w = avail_w
         h = w / aspect
@@ -549,6 +682,7 @@ class MainWindow(QMainWindow):
         self.art_w.setValue(w)
         self.art_h.setValue(h)
         self._syncing = False
+        self._sync_scale()
         self.center_on_paper()
 
     def center_on_paper(self):
@@ -563,29 +697,54 @@ class MainWindow(QMainWindow):
         self.scene.addRect(0, 0, pw, ph, QPen(QColor("#888888")),
                            QBrush(QColor("#ffffff")))
         origin_pen = QPen(QColor("#cc4444"))
-        self.scene.addLine(-8, ph, 8, ph, origin_pen)   # work origin marker
-        self.scene.addLine(0, ph - 8, 0, ph + 8, origin_pen)
+        # Work origin (machine 0,0) is the paper's top-left corner; X grows
+        # right and Y grows down, exactly like the generated G-code.
+        self.scene.addLine(-8, 0, 8, 0, origin_pen)
+        self.scene.addLine(0, -8, 0, 8, origin_pen)
 
         if self.artwork is not None:
             s = self.current_settings()
-            # Draw in paper space (how the plot will actually look);
-            # machine mirroring is applied only to the G-code.
-            sx = s.out_width_mm / max(self.artwork.width, 1e-9)
-            sy = s.out_height_mm / max(self.artwork.height, 1e-9)
-            left = s.offset_x_mm
-            top = ph - s.offset_y_mm - s.out_height_mm
+            # Use the very same transform as the G-code (offsets, mirror
+            # flags) so the preview is exactly what the plotter draws.
+            tf = make_transform(self.artwork, s)
+            use_op = s.pressure_from_opacity
+            levels = 10
             for layer in self._checked_layers():
-                pen = QPen(QColor(layer.color))
-                pen.setWidthF(0.4)
-                path = QPainterPath()
-                for pl in layer.polylines:
-                    x0, y0 = pl[0]
-                    path.moveTo(left + (x0 - self.artwork.min_x) * sx,
-                                top + (y0 - self.artwork.min_y) * sy)
-                    for x, y in pl[1:]:
-                        path.lineTo(left + (x - self.artwork.min_x) * sx,
-                                    top + (y - self.artwork.min_y) * sy)
-                self.scene.addPath(path, pen)
+                # One path per opacity bucket keeps the scene light even
+                # when opacity varies along every stroke.
+                buckets = [QPainterPath() for _ in range(levels + 1)]
+                ops = layer.opacities or [1.0] * len(layer.polylines)
+                for pl, op in zip(layer.polylines, ops):
+                    pts = [tf(x, y) for x, y in pl]
+                    if not use_op:
+                        op = 1.0
+                    if not isinstance(op, (list, tuple)):
+                        if op >= s.min_opacity:
+                            b = buckets[round(op * levels)]
+                            b.moveTo(*pts[0])
+                            for p in pts[1:]:
+                                b.lineTo(*p)
+                        continue
+                    last = None
+                    for i in range(len(pts) - 1):
+                        o = 0.5 * (op[i] + op[i + 1])
+                        if o < s.min_opacity:
+                            last = None
+                            continue
+                        k = round(o * levels)
+                        if last != k:
+                            buckets[k].moveTo(*pts[i])
+                            last = k
+                        buckets[k].lineTo(*pts[i + 1])
+                for k, bpath in enumerate(buckets):
+                    if bpath.isEmpty():
+                        continue
+                    col = QColor(layer.color)
+                    col.setAlphaF(max(k / levels, 0.1))
+                    pen = QPen(col)
+                    pen.setWidthF(0.4)
+                    pen.setCapStyle(Qt.RoundCap)
+                    self.scene.addPath(bpath, pen)
         self.scene.setSceneRect(-30, -30, pw + 60, ph + 60)
         self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
@@ -761,6 +920,7 @@ class MainWindow(QMainWindow):
         self.log(f"Saved {len(lines)} lines to {path}")
 
     def closeEvent(self, event):
+        self._save_prefs()
         if self.job and self.job.isRunning():
             self.job.abort()
             self.job.wait(3000)
@@ -770,6 +930,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setOrganizationName("PlotStudio")
+    app.setApplicationName("PlotStudio")
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
